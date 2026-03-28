@@ -1,10 +1,12 @@
-// server.js — Remote Habitica MCP Server (SSE transport)
-// Deploy on Render/Railway/Fly.io → Add URL as custom connector on claude.ai
+// server.js — Remote Habitica MCP Server
+// Supports both Streamable HTTP (/mcp) and SSE (/sse) transports
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import cors from "cors";
+import { randomUUID } from "crypto";
 import { z } from "zod";
 
 import * as habitica from "./habitica-api.js";
@@ -12,15 +14,22 @@ import * as habitica from "./habitica-api.js";
 // ── Express app ──────────────────────────────────────────
 
 const app = express();
-app.use(cors());
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "mcp-session-id", "Accept"],
+  exposedHeaders: ["mcp-session-id"],
+}));
+
 app.use(express.json());
 
-// Health check (Render uses this to know the service is alive)
+// Health check
 app.get("/", (_req, res) => {
   res.json({
     status: "ok",
     server: "habitica-mcp-remote",
-    message: "Habitica MCP Server is running. Connect via /sse endpoint.",
+    message: "Habitica MCP Server is running. Connect via /mcp or /sse endpoint.",
   });
 });
 
@@ -81,14 +90,13 @@ function createMcpServer() {
 
         const task = await habitica.createTask(taskData);
 
-        // Add checklist items if provided
         if (checklist?.length) {
           for (const item of checklist) {
             await habitica.addChecklistItem(task.id, item);
           }
         }
 
-        return { content: [{ type: "text", text: `✅ Created ${type}: "${text}" (ID: ${task.id})` }] };
+        return { content: [{ type: "text", text: `Created ${type}: "${text}" (ID: ${task.id})` }] };
       } catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
       }
@@ -114,7 +122,7 @@ function createMcpServer() {
         if (priority) updates.priority = parseFloat(priority);
 
         const task = await habitica.updateTask(taskId, updates);
-        return { content: [{ type: "text", text: `✅ Updated task: "${task.text}"` }] };
+        return { content: [{ type: "text", text: `Updated task: "${task.text}"` }] };
       } catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
       }
@@ -130,7 +138,7 @@ function createMcpServer() {
     async ({ taskId }) => {
       try {
         await habitica.deleteTask(taskId);
-        return { content: [{ type: "text", text: `🗑️ Task deleted successfully.` }] };
+        return { content: [{ type: "text", text: `Task deleted successfully.` }] };
       } catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
       }
@@ -152,7 +160,7 @@ function createMcpServer() {
         return {
           content: [{
             type: "text",
-            text: `⚡ Task scored ${direction}! HP: ${Math.round(result.hp)}, EXP: ${Math.round(result.exp)}, Gold: ${Math.round(result.gp)}`,
+            text: `Task scored ${direction}! HP: ${Math.round(result.hp)}, EXP: ${Math.round(result.exp)}, Gold: ${Math.round(result.gp)}`,
           }],
         };
       } catch (e) {
@@ -173,7 +181,7 @@ function createMcpServer() {
     async ({ taskId, text }) => {
       try {
         await habitica.addChecklistItem(taskId, text);
-        return { content: [{ type: "text", text: `✅ Added checklist item: "${text}"` }] };
+        return { content: [{ type: "text", text: `Added checklist item: "${text}"` }] };
       } catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
       }
@@ -192,7 +200,7 @@ function createMcpServer() {
     async ({ taskId, itemId }) => {
       try {
         await habitica.scoreChecklistItem(taskId, itemId);
-        return { content: [{ type: "text", text: `✅ Checklist item toggled.` }] };
+        return { content: [{ type: "text", text: `Checklist item toggled.` }] };
       } catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
       }
@@ -225,7 +233,7 @@ function createMcpServer() {
     async ({ name }) => {
       try {
         const tag = await habitica.createTag(name);
-        return { content: [{ type: "text", text: `🏷️ Created tag: "${name}" (ID: ${tag.id})` }] };
+        return { content: [{ type: "text", text: `Created tag: "${name}" (ID: ${tag.id})` }] };
       } catch (e) {
         return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
       }
@@ -251,24 +259,100 @@ function createMcpServer() {
   return server;
 }
 
-// ── SSE Transport (per-connection) ───────────────────────
+// ══════════════════════════════════════════════════════════
+// TRANSPORT 1: Streamable HTTP (/mcp) — preferred by claude.ai
+// ══════════════════════════════════════════════════════════
 
-// Store active transports for the message endpoint
-const transports = {};
+const httpTransports = {};
+
+app.post("/mcp", async (req, res) => {
+  try {
+    const sessionId = req.headers["mcp-session-id"];
+
+    // Existing session
+    if (sessionId && httpTransports[sessionId]) {
+      const transport = httpTransports[sessionId];
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    // New session
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+    });
+
+    const server = createMcpServer();
+
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid && httpTransports[sid]) {
+        delete httpTransports[sid];
+      }
+      server.close();
+    };
+
+    await server.connect(transport);
+
+    httpTransports[transport.sessionId] = transport;
+
+    await transport.handleRequest(req, res, req.body);
+  } catch (e) {
+    console.error("POST /mcp error:", e);
+    if (!res.headersSent) {
+      res.status(500).json({ error: e.message });
+    }
+  }
+});
+
+app.get("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  if (!sessionId || !httpTransports[sessionId]) {
+    res.status(400).json({ error: "No active session. Send an initialize request first via POST /mcp" });
+    return;
+  }
+  try {
+    const transport = httpTransports[sessionId];
+    await transport.handleRequest(req, res);
+  } catch (e) {
+    console.error("GET /mcp error:", e);
+    if (!res.headersSent) {
+      res.status(500).json({ error: e.message });
+    }
+  }
+});
+
+app.delete("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  if (sessionId && httpTransports[sessionId]) {
+    try {
+      const transport = httpTransports[sessionId];
+      await transport.close();
+      delete httpTransports[sessionId];
+    } catch (e) {
+      console.error("DELETE /mcp error:", e);
+    }
+  }
+  res.status(200).end();
+});
+
+// ══════════════════════════════════════════════════════════
+// TRANSPORT 2: SSE (/sse) — legacy fallback
+// ══════════════════════════════════════════════════════════
+
+const sseTransports = {};
 
 app.get("/sse", async (req, res) => {
-  console.log("🔌 New SSE connection");
+  console.log("SSE connection opened");
 
   const transport = new SSEServerTransport("/messages", res);
   const sessionId = transport.sessionId;
-  transports[sessionId] = transport;
+  sseTransports[sessionId] = transport;
 
   const server = createMcpServer();
 
-  // Clean up on disconnect
   res.on("close", () => {
-    console.log(`🔌 SSE connection closed: ${sessionId}`);
-    delete transports[sessionId];
+    console.log(`SSE connection closed: ${sessionId}`);
+    delete sseTransports[sessionId];
     server.close();
   });
 
@@ -277,10 +361,10 @@ app.get("/sse", async (req, res) => {
 
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
+  const transport = sseTransports[sessionId];
 
   if (!transport) {
-    return res.status(400).json({ error: "No active SSE connection for this session" });
+    return res.status(400).json({ error: "No active SSE session" });
   }
 
   await transport.handlePostMessage(req, res);
@@ -292,8 +376,9 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`
 🎮 Habitica MCP Server running!
-   Health:  http://localhost:${PORT}/
-   SSE:     http://localhost:${PORT}/sse
+   Health:     http://localhost:${PORT}/
+   HTTP (new): http://localhost:${PORT}/mcp
+   SSE (old):  http://localhost:${PORT}/sse
    Ready for claude.ai custom connector
   `);
 });
